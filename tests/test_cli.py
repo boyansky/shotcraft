@@ -593,3 +593,10 @@ class TestVersionAndOrder(unittest.TestCase):
         # the version used to ride on the tagline and broke its centring
         tagline = [l for l in cli.format_banner().splitlines() if "intent ·" in l][0]
         self.assertNotIn("v0.", tagline)
+
+    def test_readme_shows_the_same_art_as_the_banner(self):
+        # the README is the repo's front page; if the art drifts from the real
+        # banner the first thing anyone sees is already a lie
+        readme = (pathlib.Path(__file__).parent.parent / "README.md").read_text()
+        for line in cli.LOGO.strip("\n").splitlines():
+            self.assertIn(line, readme, f"README missing logo line: {line!r}")

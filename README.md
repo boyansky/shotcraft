@@ -1,7 +1,27 @@
 # shotcraft
 
+```
+          ⠀⠀⠀⠀⠀⠀⠀⠀⠀⢠⠞⠉⠉⠓⠲⠤⣄⣀⠀⠀⠀⠀⠀
+          ⠀⠀⠀⠀⠀⠀⠀⢀⡴⠋⠀⠀⠀⠀⠀⠀⠀⠈⠙⠒⠦⢤⣀
+          ⠤⠴⠚⠉⠉⠉⠉⠉⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀
+          ╭─────────────────────╮
+          │                     │
+          ╲▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒╱
+           ╲▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒╱
+            ╰─────────────────╯
+
+  █▀▀ █  █ █▀▀█ ▀█▀ █▀▀ █▀▀█ █▀▀█ █▀▀ ▀█▀
+  ▀▀█ █▀▀█ █  █  █  █   █▄▄▀ █▄▄█ █▀▀  █ 
+  ▀▀▀ ▀  ▀ ▀▀▀▀  ▀  ▀▀▀ ▀  ▀ ▀  ▀ ▀    ▀ 
+
+         intent · telemetry · taste
+```
+
 A read-only shot record for Meticulous espresso machines: profile intent,
 machine telemetry, and your own taste, in one place.
+
+The mark is an extraction curve drawn in braille, rising off a shot glass whose
+rim doubles as the x-axis.
 
 ## Safety
 
