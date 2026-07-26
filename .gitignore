@@ -1,0 +1,9 @@
+*.pyc
+__pycache__/
+.venv/
+.DS_Store
+
+# your record lives in the XDG data dir, never in the package
+shots.jsonl
+bags.jsonl
+telemetry/

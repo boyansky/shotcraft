@@ -1,0 +1,44 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "shotcraft"
+dynamic = ["version"]
+description = "A read-only shot record for Meticulous espresso machines: profile intent, machine telemetry, and taste"
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+requires-python = ">=3.11"
+authors = [{ name = "Boyan Vassilev" }]
+keywords = ["espresso", "meticulous", "coffee", "cli", "telemetry"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Environment :: Console",
+    "Intended Audience :: End Users/Desktop",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.11",
+    "Topic :: Utilities",
+]
+
+# No runtime dependencies, deliberately. The whole tool is standard library,
+# which is why it can be trusted to talk to an appliance and why it will still
+# install years from now. Please do not add one without a very good reason.
+dependencies = []
+
+[project.urls]
+Homepage = "https://github.com/boyansky/shotcraft"
+Issues = "https://github.com/boyansky/shotcraft/issues"
+
+[project.scripts]
+shotcraft = "shotcraft.cli:main"
+
+[tool.hatch.version]
+path = "shotcraft/__init__.py"
+
+[tool.hatch.build.targets.wheel]
+packages = ["shotcraft"]
+
+[tool.hatch.build.targets.sdist]
+include = ["shotcraft", "tests", "README.md", "LICENSE"]
