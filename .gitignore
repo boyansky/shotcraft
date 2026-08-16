@@ -7,3 +7,10 @@ __pycache__/
 shots.jsonl
 bags.jsonl
 telemetry/
+
+# SDD scratch: ledger, briefs, review packages. Never the repo.
+.superpowers/
+grinders.jsonl
+dials.jsonl
+last_sync.json
+last_nudge

@@ -51,12 +51,17 @@ Config lives in `~/.config/shotcraft/config.json`; your record lives in
 
 ## Use
 
-    shotcraft sync            # pull new shots, list the ones awaiting a rating
-    shotcraft bag             # register a new bag of beans
-    shotcraft bags            # list bags, marking the current one
-    shotcraft rate <shot_id>  # enter dose, grind and taste
-    shotcraft report          # corpus summary with sample sizes
-    shotcraft check <shot_id> # did the shot track its profile?
+    shotcraft sync             # pull new shots, list the ones awaiting a rating
+    shotcraft sync --from DIR  # ingest from a directory of blob files instead
+    shotcraft bag              # register a new bag of beans
+    shotcraft bags             # list bags, marking the current one
+    shotcraft grinder          # register a grinder
+    shotcraft grinders         # list registered grinders
+    shotcraft dial <value>     # record a re-dial: grind, and dose if it changed
+    shotcraft rate <shot_id>   # taste it blind, then see what the machine did
+    shotcraft report           # corpus summary with sample sizes
+    shotcraft check <shot_id>  # did the shot track its profile?
+    shotcraft nudge            # one line for a shell prompt hook, else silent
 
 `shotcraft` is a wrapper on your PATH that sets `PYTHONPATH` and runs the
 package, so it works from any directory. Without it, the equivalent is
@@ -67,8 +72,8 @@ displayed name from however you invoked it, so an alias stays consistent.
 too, and so does any unambiguous prefix of it.
 
 A typical loop: pull the shot with `sync`, drink it and `rate` it, then look at
-`report` and `check`. Every human field goes in through `rate` or `bag`, which
-validate what you type.
+`report` and `check`. Every human field goes in through `rate`, `bag`,
+`grinder` or `dial`, which validate what you type.
 
 **Never hand-edit `shots.jsonl` to enter a rating.** Yield, time and ratio sit
 on the same line as the taste fields, so editing the file means rating the shot
@@ -76,24 +81,46 @@ while looking at the machine's verdict, which is the one thing that destroys
 taste as an independent signal. `rate` shows you the profile name and the time
 and nothing else, on purpose.
 
+### Getting reminded
+
+`nudge` prints at most one line, at most once a day, reads only local files and
+opens no socket, so it is safe in a shell prompt:
+
+    # ~/.zshrc
+    autoload -Uz add-zsh-hook
+    add-zsh-hook precmd shotcraft_nudge
+    shotcraft_nudge() { shotcraft nudge 2>/dev/null }
+
+It is the trigger. Terminals get opened constantly; `shotcraft` does not.
+
 ## Rating protocol
 
 Rate **before** looking at telemetry, time, or yield. Seeing the numbers first
 turns taste into an echo of the machine instead of an independent signal.
 Rate on the first two sips, within ~30 seconds. Rough and fast beats blank.
 
-All integers 0-10. Sour and bitter are asked separately because a shot can be
-both at once, which is what uneven extraction tastes like.
+Four prompts on the common path: bag confirmation, then the taste call below,
+then an optional note. A same-day previous shot adds a fifth (`vs previous
+shot`).
 
-| sour    | 0 none · 3 slight brightness · 6 hollow · 10 puckering |
-| bitter  | 0 none · 3 dry finish · 6 drying · 10 ashy |
-| body    | 0 watery · 3 skim · 5 whole milk · 8 cream · 10 syrupy |
-| overall | 0 poured it out · 5 fine · 7 would repeat · 10 best yet |
+| lean      | s sour · b bitter · x both · - balanced |
+| intensity | 1 slight · 2 clear · 3 badly  (skipped when lean is `-`) |
+| vs previous shot | b better · w worse · = same  (optional: only asked when another shot from that day is already in the record, rated or not — it was still tasted) |
 
-Ratings are stamped with the scale version in force (`taste_schema`, now 2).
-Rows from different versions are shown but never pooled: a v1 rating renders
-with a `v1` prefix, because v1's single sour/bitter axis genuinely cannot say
-whether a 0 meant "balanced" or "both at once".
+`both` is a real answer, not a compromise: a shot can be sour and bitter at
+once, which is what uneven extraction tastes like, and collapsing that onto a
+single direction would record the most diagnostic shot as the least.
+
+Dose and grind are no longer typed at rating time. They resolve from the
+dial-in log (`dial`) instead, because they are properties of the setup, not
+of the cup, and asking again every morning is exactly the kind of keystroke
+that killed the previous version of this tool.
+
+Ratings are stamped with the scale version in force (`taste_schema`, now 3).
+Rows from older versions are shown but never pooled: a v1 or v2 rating renders
+with a `v1`/`v2` prefix, because neither the single sour/bitter axis of v1 nor
+the four absolute scales of v2 can be converted into schema 3's direction
+without inventing the direction.
 
 ## Tests
 
@@ -105,7 +132,7 @@ Issues and pull requests welcome, especially from people who own one of these
 machines. Bug reports are most useful with the output of `shotcraft setup
 --show` and, if a shot is involved, its `check` output.
 
-    python3 -m unittest discover -s tests     # 251 tests, no network needed
+    python3 -m unittest discover -s tests     # 383 tests, no network needed
 
 Tests run against captured fixtures and never contact a machine. If you add a
 feature that talks to one, keep the impure part injectable so it stays that way.
@@ -127,7 +154,13 @@ tool lie, and each is pinned by a test:
   its conclusions would be acted on.
 - **`taste_schema` is versioned and ratings are never migrated across
   versions.** A v1 rating genuinely cannot say whether a 0 meant "balanced" or
-  "sour and bitter at once", so converting it would invent data.
+  "sour and bitter at once", so converting it would invent data. Schema 3 keeps
+  a `both` lean value for the same underlying reason: a shot can be sour and
+  bitter at once, and collapsing that onto a single direction would record the
+  most diagnostic shot as the least.
+- **`nudge` never raises and never opens a socket.** It sits in a shell prompt
+  hook, so a corrupt `shots.jsonl` or a stale stamp file must degrade to
+  silence, never to a traceback on every new terminal.
 - **Zero runtime dependencies.** Standard library only.
 
 ## Not affiliated with Meticulous

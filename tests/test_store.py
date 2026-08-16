@@ -1,4 +1,5 @@
-import json, tempfile, pathlib, unittest
+import datetime, json, tempfile, pathlib, unittest
+from unittest.mock import patch
 from shotcraft.store import Store
 
 ROW = {"id": "abc123", "ts": "2026-07-25T12:44:27", "profile": "Turbo"}
@@ -78,6 +79,31 @@ class TestStore(unittest.TestCase):
         with self.assertRaises(KeyError):
             self.store.update_shot("nope", {"grind": 2.8})
 
+    def test_update_shot_survives_a_failed_replace(self):
+        # a truncate-then-rewrite would already have zeroed shots.jsonl by
+        # the time os.replace could fail; an atomic write leaves the ORIGINAL
+        # file untouched until the swap actually succeeds
+        self.store.append_shots([ROW, {**ROW, "id": "def456"}])
+        original = self.store.shots_path.read_text()
+        with patch("shotcraft.store.os.replace", side_effect=OSError("disk full")):
+            with self.assertRaises(OSError):
+                self.store.update_shot("abc123", {"grind": 2.8})
+        self.assertEqual(self.store.shots_path.read_text(), original)
+
+    def test_update_shot_leaves_no_temp_file_behind_on_success(self):
+        self.store.append_shots([ROW])
+        self.store.update_shot("abc123", {"grind": 2.8})
+        self.assertEqual(list(self.store.root.glob("*.tmp")), [])
+
+    def test_write_telemetry_survives_a_failed_replace(self):
+        self.store.write_telemetry("abc123", {"data": [1]})
+        path = self.store.telemetry_dir / "abc123.json"
+        original = path.read_text()
+        with patch("shotcraft.store.os.replace", side_effect=OSError("disk full")):
+            with self.assertRaises(OSError):
+                self.store.write_telemetry("abc123", {"data": [2, 3, 4, 5]})
+        self.assertEqual(path.read_text(), original)
+
 class TestResolveShotId(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -110,6 +136,107 @@ class TestResolveShotId(unittest.TestCase):
     def test_telemetry_only_id_is_resolvable(self):
         self.store.write_telemetry("aaaa1111-2222", {"data": []})
         self.assertEqual(self.store.resolve_shot_id("aaaa"), "aaaa1111-2222")
+
+class TestGrinders(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.store = Store(pathlib.Path(self.tmp.name))
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_append_and_load(self):
+        self.assertEqual(self.store.append_grinder({"id": "g001"}), 1)
+        self.assertEqual([g["id"] for g in self.store.load_grinders()], ["g001"])
+
+    def test_duplicate_id_is_refused(self):
+        self.store.append_grinder({"id": "g001"})
+        self.assertEqual(self.store.append_grinder({"id": "g001"}), 0)
+        self.assertEqual(len(self.store.load_grinders()), 1)
+
+    def test_lookup_by_id(self):
+        self.store.append_grinder({"id": "g001", "model": "K-Ultra"})
+        self.assertEqual(self.store.grinder_by_id("g001")["model"], "K-Ultra")
+        self.assertIsNone(self.store.grinder_by_id("g999"))
+
+DIAL = {"ts": "2026-08-01T08:00:00", "grinder": "g001", "bag": "b001",
+        "grind": 3.1, "dose_g": 18.0, "note": ""}
+
+class TestDials(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.store = Store(pathlib.Path(self.tmp.name))
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_append_and_load(self):
+        self.assertEqual(self.store.append_dial(DIAL), 1)
+        self.assertEqual(self.store.load_dials(), [DIAL])
+
+    def test_appending_an_identical_dial_twice_yields_two_rows(self):
+        # unlike append_bag/append_grinder, append_dial never dedupes:
+        # re-dialling back to the same number on a different day is a real
+        # event, not a duplicate to be suppressed. This is the store-level
+        # pin on that deliberate asymmetry.
+        self.store.append_dial(DIAL)
+        self.store.append_dial(DIAL)
+        self.assertEqual(len(self.store.load_dials()), 2)
+
+STAMP_TS = "2026-08-01T09:00:00"
+
+class TestSyncStamp(unittest.TestCase):
+    """nudge trusts sync_age_days for the one line it prints, so both halves
+    of the round trip -- and the failure modes that must collapse to the same
+    'never synced' sentinel as a fresh install -- are pinned here."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.store = Store(pathlib.Path(self.tmp.name))
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_never_synced_is_infinite(self):
+        self.assertEqual(self.store.sync_age_days(), float("inf"))
+
+    def test_stamp_is_written_as_isoformat_json(self):
+        when = datetime.datetime.fromisoformat(STAMP_TS)
+        self.store.write_sync_stamp(now=when)
+        self.assertEqual(
+            json.loads(self.store.sync_stamp_path.read_text())["ts"],
+            when.isoformat(timespec="seconds"))
+
+    def test_age_is_zero_immediately_after_a_stamp(self):
+        when = datetime.datetime.fromisoformat(STAMP_TS)
+        self.store.write_sync_stamp(now=when)
+        self.assertEqual(self.store.sync_age_days(now=when), 0.0)
+
+    def test_write_sync_stamp_survives_a_failed_replace(self):
+        when = datetime.datetime.fromisoformat(STAMP_TS)
+        self.store.write_sync_stamp(now=when)
+        original = self.store.sync_stamp_path.read_text()
+        later = when + datetime.timedelta(days=1)
+        with patch("shotcraft.store.os.replace", side_effect=OSError("disk full")):
+            with self.assertRaises(OSError):
+                self.store.write_sync_stamp(now=later)
+        self.assertEqual(self.store.sync_stamp_path.read_text(), original)
+
+    def test_age_reflects_elapsed_time(self):
+        when = datetime.datetime.fromisoformat(STAMP_TS)
+        self.store.write_sync_stamp(now=when)
+        later = when + datetime.timedelta(days=2, hours=12)
+        self.assertEqual(self.store.sync_age_days(now=later), 2.5)
+
+    def test_corrupt_stamp_file_is_infinite_not_a_crash(self):
+        self.store.root.mkdir(parents=True, exist_ok=True)
+        self.store.sync_stamp_path.write_text("not valid json")
+        self.assertEqual(self.store.sync_age_days(), float("inf"))
+
+    def test_stamp_file_missing_ts_key_is_infinite(self):
+        self.store.root.mkdir(parents=True, exist_ok=True)
+        self.store.sync_stamp_path.write_text(json.dumps({"unrelated": "x"}))
+        self.assertEqual(self.store.sync_age_days(), float("inf"))
 
 if __name__ == "__main__":
     unittest.main()

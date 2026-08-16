@@ -11,29 +11,6 @@ def load_shot(name):
             return entry
     raise AssertionError(f"no fixture shot named {name}")
 
-class TestTaste(unittest.TestCase):
-    def test_valid_taste_passes(self):
-        validate_taste({"sour": 2, "bitter": 1, "body": 5, "overall": 6})
-
-    def test_none_is_allowed_unrated(self):
-        validate_taste(None)
-
-    def test_sour_below_range_raises(self):
-        with self.assertRaises(ValueError):
-            validate_taste({"sour": -1, "bitter": 1, "body": 5, "overall": 6})
-
-    def test_body_above_range_raises(self):
-        with self.assertRaises(ValueError):
-            validate_taste({"sour": 2, "bitter": 1, "body": 11, "overall": 6})
-
-    def test_missing_key_raises(self):
-        with self.assertRaises(ValueError):
-            validate_taste({"sour": 2, "bitter": 1, "body": 5})
-
-    def test_non_integer_raises(self):
-        with self.assertRaises(ValueError):
-            validate_taste({"sour": 0.5, "bitter": 1, "body": 5, "overall": 6})
-
 class TestComputed(unittest.TestCase):
     def test_ratio(self):
         self.assertAlmostEqual(compute_ratio(50.2, 18.0), 2.79, places=2)
@@ -64,7 +41,7 @@ class TestShotRow(unittest.TestCase):
 
     def test_rated_row_is_stamped_with_current_schema(self):
         row = shot_row(load_shot("Turbo"),
-                       taste={"sour": 2, "bitter": 1, "body": 5, "overall": 6})
+                       taste={"lean": "sour", "intensity": 2, "versus": None})
         self.assertEqual(row["taste_schema"], TASTE_SCHEMA)
 
     def test_days_off_roast_is_never_stored(self):
@@ -90,7 +67,8 @@ class TestShotRow(unittest.TestCase):
 
     def test_invalid_taste_rejected_at_row_construction(self):
         with self.assertRaises(ValueError):
-            shot_row(load_shot("Turbo"), taste={"sour": 99, "bitter": 1, "body": 5, "overall": 6})
+            shot_row(load_shot("Turbo"),
+                     taste={"lean": "sour", "intensity": 99, "versus": None})
 
     def test_healthy_row_carries_an_empty_flag_list(self):
         self.assertEqual(shot_row(load_shot("Turbo"))["flags"], [])
@@ -131,40 +109,24 @@ if __name__ == "__main__":
     unittest.main()
 
 
-class TestSchemaV2(unittest.TestCase):
-    """v2 split sour_bitter into two axes because a shot can be both at once,
-    and widened every axis to 0-10 because 1-5 piled onto 3 and 4."""
+from shotcraft.model import grinder_row, validate_grinder
 
-    GOOD = {"sour": 6, "bitter": 5, "body": 7, "overall": 4}
 
-    def test_schema_version_is_two(self):
-        self.assertEqual(TASTE_SCHEMA, 2)
+class TestGrinder(unittest.TestCase):
+    def test_row_carries_every_field(self):
+        row = grinder_row("1Zpresso", "K-Ultra", "decimal dial 0.0-9.0", "lower")
+        self.assertEqual(row["make"], "1Zpresso")
+        self.assertEqual(row["model"], "K-Ultra")
+        self.assertEqual(row["scale"], "decimal dial 0.0-9.0")
+        self.assertEqual(row["finer_direction"], "lower")
+        self.assertEqual(row["note"], "")
 
-    def test_sour_and_bitter_are_independent_axes(self):
-        # the case v1 could not express: both high at once = uneven extraction
-        validate_taste({"sour": 8, "bitter": 8, "body": 5, "overall": 2})
-
-    def test_all_axes_span_zero_to_ten_inclusive(self):
-        validate_taste({"sour": 0, "bitter": 0, "body": 0, "overall": 0})
-        validate_taste({"sour": 10, "bitter": 10, "body": 10, "overall": 10})
-
-    def test_above_ten_raises(self):
+    def test_finer_direction_must_be_lower_or_higher(self):
         with self.assertRaises(ValueError):
-            validate_taste({**self.GOOD, "sour": 11})
+            validate_grinder({"make": "x", "model": "y", "scale": "z",
+                              "finer_direction": "clockwise"})
 
-    def test_below_zero_raises(self):
+    def test_model_is_required(self):
         with self.assertRaises(ValueError):
-            validate_taste({**self.GOOD, "bitter": -1})
-
-    def test_old_v1_shape_is_rejected_by_the_current_validator(self):
-        # v1 rows are never re-validated, but a v1-shaped NEW rating must fail
-        with self.assertRaises(ValueError):
-            validate_taste({"sour_bitter": 0, "body": 3, "overall": 4})
-
-    def test_decimals_still_rejected(self):
-        with self.assertRaises(ValueError):
-            validate_taste({**self.GOOD, "overall": 7.5})
-
-    def test_rated_row_stamps_schema_two(self):
-        row = shot_row(load_shot("Turbo"), taste=self.GOOD)
-        self.assertEqual(row["taste_schema"], 2)
+            validate_grinder({"make": "1Zpresso", "model": "", "scale": "z",
+                              "finer_direction": "lower"})

@@ -1,59 +1,50 @@
 """Shot and bag record construction, plus taste-scale validation.
 
-TASTE_SCHEMA is versioned on purpose. Boyan had never rated a shot when this
-scale was defined, so it is expected to be revised. Rows carrying different
-schema versions must never be silently pooled by analysis.
+TASTE_SCHEMA is versioned on purpose: nobody had rated a single shot when
+this scale was first defined, so it is expected to be revised. Rows carrying
+different schema versions must never be silently pooled by analysis.
 """
 import datetime
 
 from .derive import derive
 
-TASTE_SCHEMA = 2
+# Schema and validation live in taste.py as of schema 3. Re-exported here
+# because model is where every caller already imports them from, and a rename
+# would churn call sites for no gain.
+from .taste import TASTE_SCHEMA, validate_taste  # noqa: F401
 
 # Flags name a defect in a row rather than hiding it. A row whose telemetry
 # could not be parsed must not render identically to a healthy one.
 FLAG_TELEMETRY = "telemetry_unparsed"
 FLAG_UNKNOWN_BAG = "unknown_bag"
 
-# v2 (2026-07-26) split v1's single `sour_bitter` axis into two independent
-# axes and widened everything to 0-10.
-#
-# WHY TWO AXES: a shot can be sour AND bitter at once. That is not a
-# contradiction, it is the signature of uneven extraction — part of the puck
-# under-extracted, part over-extracted, both arriving in the cup. v1 put those
-# at opposite ends of one axis, so "both at once" landed on 0 and was recorded
-# as *balanced*: the most diagnostically interesting shot, logged as the least.
-#
-# WHY 0-10: on v1's 1-5, real ratings piled onto 3 and 4 with nothing left to
-# separate them. Integers only — a decimal you cannot reproduce blind is noise
-# wearing a decimal point, and it defeats the anchors that stop a scale
-# drifting over months.
-TASTE_RANGES = {
-    "sour":    (0, 10),   # 0 none · 3 slight brightness · 6 hollow · 10 puckering
-    "bitter":  (0, 10),   # 0 none · 3 dry finish · 6 drying · 10 ashy
-    "body":    (0, 10),   # 0 watery · 3 skim · 5 whole milk · 8 cream · 10 syrupy
-    "overall": (0, 10),   # 0 poured it out · 5 fine · 7 would repeat · 10 best yet
-}
-
-
-def validate_taste(taste):
-    """Raise ValueError unless taste is None or a complete, in-range rating."""
-    if taste is None:
-        return
-    for key, (low, high) in TASTE_RANGES.items():
-        if key not in taste:
-            raise ValueError(f"taste missing required key {key!r}")
-        value = taste[key]
-        if isinstance(value, bool) or not isinstance(value, int):
-            raise ValueError(f"taste.{key} must be an int, got {value!r}")
-        if not low <= value <= high:
-            raise ValueError(f"taste.{key}={value} outside {low}..{high}")
-
 
 def compute_ratio(yield_g, dose_g):
     if yield_g is None or not dose_g:
         return None
     return round(float(yield_g) / float(dose_g), 2)
+
+
+def most_recently_used_bag(bags, rows):
+    """The bag most recently used by a shot, else the most recently registered.
+
+    "Most recently registered" is almost never the bag in the grinder once
+    several are in rotation, and defaulting to the wrong bean is worse than
+    defaulting to none — a wrong label is indistinguishable from a right one
+    afterwards. Falls back to registration order only when nothing has used
+    a bag yet, because there is nothing used to point at.
+
+    Shared by `entry.current_bag_id` (which resolves it from a `Store`) and
+    `format.format_bags` (which marks it in the bag listing), so the two
+    never state two different answers to the same question. Takes plain
+    lists rather than a `Store` so it stays a pure function usable from
+    `format.py` without pulling persistence into rendering.
+    """
+    used = [r for r in rows if r.get("bag")]
+    if used:
+        return max(used, key=lambda r: r.get("ts") or "")["bag"]
+    bags = list(bags)
+    return bags[-1]["id"] if bags else None
 
 
 def days_off_roast(shot_ts, roast_date):
@@ -139,3 +130,34 @@ def _safe_ts(value):
         return datetime.datetime.fromtimestamp(value).isoformat(timespec="seconds")
     except (TypeError, ValueError, OSError, OverflowError):
         return None
+
+
+# A grind reading is meaningless without the device that produced it: swap
+# grinders and every historical number silently becomes incomparable, which is
+# the failure taste_schema versioning exists to prevent, left unguarded one
+# field over. So the grinder is an entity and grind is never pooled across ids.
+FINER_DIRECTIONS = ("lower", "higher")
+
+
+def validate_grinder(grinder):
+    """Raise ValueError unless the grinder is complete and usable."""
+    for key in ("make", "model", "scale"):
+        if not (grinder.get(key) or "").strip():
+            raise ValueError(f"grinder {key} is required")
+    direction = grinder.get("finer_direction")
+    if direction not in FINER_DIRECTIONS:
+        raise ValueError(
+            f"finer_direction must be one of {FINER_DIRECTIONS}, got {direction!r}")
+
+
+def grinder_row(make, model, scale, finer_direction, note=""):
+    """Build a grinder row. `id` is assigned by the caller.
+
+    `finer_direction` is load-bearing, not description: advice of the form
+    "grind finer" cannot be rendered without knowing which way the dial runs.
+    """
+    row = {"id": None, "make": make.strip(), "model": model.strip(),
+           "scale": scale.strip(), "finer_direction": finer_direction,
+           "note": note.strip()}
+    validate_grinder(row)
+    return row

@@ -63,6 +63,35 @@ class TestSync(unittest.TestCase):
             sync(DeadAPI(), self.store)
         self.assertEqual(self.store.load_shots(), [])
 
+    def test_successful_sync_writes_a_sync_stamp(self):
+        # nudge ages this stamp to warn about a silently failing scheduled
+        # sync, so a real success has to leave one behind.
+        self.assertFalse(self.store.sync_stamp_path.exists())
+        sync(FakeAPI(self.entries), self.store)
+        self.assertTrue(self.store.sync_stamp_path.exists())
+        self.assertLess(self.store.sync_age_days(), 1.0)
+
+    def test_failed_sync_writes_no_sync_stamp(self):
+        # the stamp exists to make a silent failure visible; a sync that
+        # never wrote a shot must not also claim to have succeeded.
+        with self.assertRaises(MachineUnreachable):
+            sync(DeadAPI(), self.store)
+        self.assertFalse(self.store.sync_stamp_path.exists())
+        self.assertEqual(self.store.sync_age_days(), float("inf"))
+
+    def test_http_path_stamps_now(self):
+        # stamp_now defaults True: a live round trip to the machine just
+        # proved the archive is, right now, as fresh as it can be
+        sync(FakeAPI(self.entries), self.store)
+        self.assertLess(self.store.sync_age_days(), 1.0)
+
+    def test_from_directory_path_stamps_the_newest_entry_not_now(self):
+        # the fixture's newest entry is dated 2026-07-25, weeks before any
+        # run of this test -- stamping `now` would hide exactly the capture
+        # staleness this path exists to surface
+        sync(FakeAPI(self.entries), self.store, stamp_now=False)
+        self.assertGreater(self.store.sync_age_days(), 10.0)
+
 class TestMalformedEntries(unittest.TestCase):
     """One bad entry must not cost the batch, nor wedge every future sync."""
 

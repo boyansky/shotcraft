@@ -1,10 +1,20 @@
-import contextlib, io, json, os, pathlib, tempfile, unittest
+import argparse, contextlib, io, json, os, pathlib, tempfile, unittest
 from unittest.mock import patch
 
 from shotcraft import cli
 from shotcraft.cli import evidence_level, format_bags, format_report
+from shotcraft.entry import current_bag_id
+from shotcraft.extract import grade, pair_note
+from shotcraft.format import format_reveal
+from shotcraft import format as fmt
+from shotcraft.store import Store
 
 FIX = pathlib.Path(__file__).parent / "fixtures"
+
+def scripted(answers):
+    """Return an `ask` callable that replays answers in order."""
+    it = iter(answers)
+    return lambda prompt: next(it)
 
 ROWS = [
     {"id": "a", "ts": "2026-07-25T12:44:27", "bag": "b001", "profile": "Turbo",
@@ -55,6 +65,15 @@ class TestFormatReport(unittest.TestCase):
     def test_empty_corpus_says_so(self):
         self.assertIn("no shots", format_report([]).lower())
 
+    def test_corpus_confidence_counts_rated_rows_only(self):
+        # a corpus that is mostly unrated must not borrow the row count's
+        # confidence -- the same fix already applied to the per-bag label.
+        # 20 unrated plus 1 rated must read "observation" (n=1), not
+        # "hypothesis" (n=21) borrowed from rows that carry no taste signal
+        many_unrated = [{**ROWS[1], "id": f"u{i}"} for i in range(20)]
+        out = format_report(many_unrated + [ROWS[0]])
+        self.assertIn("n=21, 20 unrated  [observation]", out)
+
     def test_mixed_taste_schema_is_flagged(self):
         # only RATED rows carry a schema, so the mix must be built from two
         # rated rows of different versions, not from an unrated one
@@ -62,6 +81,16 @@ class TestFormatReport(unittest.TestCase):
               "taste": {"sour_bitter": 0, "body": 3, "overall": 4},
               "taste_schema": 1}
         self.assertIn("taste_schema", format_report([v1, ROWS[0]]))
+
+    def test_partial_v1_row_does_not_crash(self):
+        # the v2 branch already read every field with .get(); v1 subscripted
+        # 'body' and 'overall' directly, so a hand-edited or partial old row
+        # raised a KeyError out of the whole report instead of rendering
+        partial_v1 = {**ROWS[0], "id": "old", "taste": {"sour_bitter": 0},
+                      "taste_schema": 1}
+        out = format_report([partial_v1], BAGS)
+        self.assertIn("sb+0", out)
+        self.assertNotIn("None", out)
 
     def test_rows_carry_a_short_id(self):
         # without an id on screen, `rate` and `check` are unreachable
@@ -167,7 +196,7 @@ class TestMain(unittest.TestCase):
         with patch.object(cli, "MeticulousAPI", Dead):
             code, out, err = self.run_main(["sync"])
         self.assertEqual(code, 1)
-        self.assertIn("unreachable", err.lower())
+        self.assertIn("Nothing written: no route to host", err)
 
     def test_sync_reports_an_unexpected_error_as_a_message(self):
         class Broken:
@@ -222,28 +251,11 @@ class TestMain(unittest.TestCase):
         self.assertIn(LEVER, out)
         self.assertEqual(self.run_main(["check", LEVER])[0], 0)
 
-    def test_bag_then_rate_then_report_round_trip(self):
-        self.sync()
-        code, out, err = self.run_main(
-            ["bag"], ["Square Mile", "Red Brick", "washed", "2026-07-18", ""])
-        self.assertEqual(code, 0, err)
-        self.assertIn("b001", out)
-
-        code, out, err = self.run_main(
-            ["rate", LEVER], ["b001", "18.0", "2.8", "1", "6", "3", "4", "tasted thin"])
-        self.assertEqual(code, 0, err)
-
-        code, out, _ = self.run_main(["report"])
-        self.assertEqual(code, 0)
-        self.assertIn("b001", out)
-        self.assertIn("sour1 bitter6 body3 overall4", out)
-        self.assertIn("1 rated", out)
-        self.assertIn("d+7", out)          # days off roast, computed at read time
-
     def test_rate_rejects_an_unknown_bag(self):
+        # rate_shot raises on the bag answer before asking anything else, so
+        # only "b999" is ever consumed; the rest was dead v2-era input
         self.sync()
-        code, _, err = self.run_main(
-            ["rate", LEVER], ["b999", "18.0", "2.8", "0", "0", "3", "4", ""])
+        code, _, err = self.run_main(["rate", LEVER], ["b999"])
         self.assertEqual(code, 1)
         self.assertIn("b999", err)
 
@@ -259,20 +271,6 @@ class TestMain(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertIn("added 0, skipped 7", out)
 
-    def test_rate_a_flagged_shot_through_the_cli_does_not_crash(self):
-        # sync's own output tells the user to rate this id, so the advertised
-        # command must work rather than dumping a traceback
-        entries = fixture_entries()[:3]
-        entries[1] = {**entries[1], "time": None}
-        flagged = entries[1]["id"]
-        _, out, _ = self.sync(entries)
-        self.assertIn(flagged[:8], out)                 # sync advertises it
-        code, _, err = self.run_main(
-            ["rate", flagged[:8]], ["", "18.0", "2.8", "0", "0", "3", "4", ""])
-        self.assertEqual(code, 0, err)
-        _, out, _ = self.run_main(["report"])
-        self.assertIn("sour0 bitter0 body3 overall4", out)
-
     def test_malformed_entry_reaches_the_report_flagged(self):
         entries = fixture_entries()[:3]
         entries[1] = {**entries[1], "time": None}
@@ -283,8 +281,33 @@ class TestMain(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertIn("!telemetry_unparsed", out)
 
-if __name__ == "__main__":
-    unittest.main()
+    def test_report_wires_agreement_tally_end_to_end(self):
+        # the real archive carries zero schema-3 ratings, so this is the only
+        # place cli.py's report handler -- the lambda threading
+        # _telemetry_loader(store) through extract.agreement_tally -- has
+        # ever actually run against schema-3 data rather than being exercised
+        # only through format_report called directly
+        store = Store(self.root)
+        store.append_bag({"id": "b001", "roaster": "r", "name": "n",
+                          "process": "washed", "roast_date": "2026-08-01",
+                          "opened": "2026-08-01", "note": ""})
+        rows = [{"id": f"s{i}", "ts": "2026-08-10T07:00:00", "bag": "b001",
+                 "grinder": "g001", "profile": "Turbo", "dose_g": 18.0,
+                 "grind": 3.1, "yield_g": 30.0, "time_s": 28.0, "ratio": 1.67,
+                 "taste": {"lean": "sour", "intensity": 2, "versus": None},
+                 "taste_schema": 3, "note": "", "flags": []} for i in range(5)]
+        store.append_shots(rows)
+        # target 40g, actual 30g: a real deficit past threshold(40)=2.0, so
+        # grade() reads it as sour -- matching every blind call, so the
+        # wiring's own math (not a stub) is what produces "5 of 5"
+        telemetry = {"profile": {"final_weight": 40.0},
+                     "data": [{"shot": {"weight": 30.0}}]}
+        for row in rows:
+            store.write_telemetry(row["id"], telemetry)
+        code, out, err = self.run_main(["report"])
+        self.assertEqual(code, 0, err)
+        self.assertIn("leans sour in 5 of 5", out)
+        self.assertIn("your calls agreed with the machine in 5 of 5", out)
 
 
 class TestFormatBags(unittest.TestCase):
@@ -311,11 +334,38 @@ class TestFormatBags(unittest.TestCase):
         self.assertIn("b002", out)
         self.assertIn("Copenhagen Roasters", out)
 
-    def test_marks_the_most_recently_added_as_current(self):
+    def test_marks_the_most_recently_used_bag_as_current(self):
+        # b001 is the OLDER registered bag but the only one any shot has
+        # used (per self.ROWS). Under the superseded "most recently
+        # registered" rule this would wrongly mark b002, which no shot has
+        # touched, so this fails against the old definition and passes
+        # against the current one.
+        out = format_bags(self.BAGS, self.ROWS, today="2026-07-25")
+        current = [l for l in out.splitlines() if l.startswith("*")]
+        self.assertEqual(len(current), 1)
+        self.assertIn("b001", current[0])
+
+    def test_falls_back_to_most_recently_registered_when_no_shot_has_used_one(self):
+        # most_recently_used_bag's fallback: with nothing used yet, there is
+        # nothing used to point at, so registration order still decides.
         out = format_bags(self.BAGS, today="2026-07-25")
         current = [l for l in out.splitlines() if l.startswith("*")]
         self.assertEqual(len(current), 1)
         self.assertIn("b002", current[0])
+
+    def test_marker_agrees_with_entry_current_bag_id(self):
+        # format_bags and entry.current_bag_id share model.most_recently_used_bag,
+        # so they can never name two different bags as "current". Drive both
+        # from one real Store round-trip rather than two hand-typed fixtures
+        # that could quietly drift apart from each other.
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(pathlib.Path(tmp))
+            for bag in self.BAGS:
+                store.append_bag(bag)
+            store.append_shots(self.ROWS)
+            out = format_bags(store.load_bags(), store.load_shots(), today="2026-07-25")
+            current = [l for l in out.splitlines() if l.startswith("*")][0]
+            self.assertIn(current_bag_id(store), current)
 
     def test_shows_days_off_roast(self):
         out = format_bags(self.BAGS, today="2026-07-25")
@@ -414,11 +464,16 @@ class TestBanner(unittest.TestCase):
 
     def test_command_list_matches_the_registered_subcommands(self):
         # a command added to the parser but missing from the banner would be
-        # undiscoverable, which is how `rate` and `check` were unreachable once
+        # undiscoverable, which is how `rate` and `check` were unreachable once,
+        # and how `nudge` was nearly unreachable again. Checked against the
+        # parser's own subparser choices, not a third hand-maintained list --
+        # a hardcoded literal here passes silently on exactly this mistake.
         listed = {name.split()[0] for name, _ in cli.COMMANDS}
-        self.assertEqual(listed,
-                         {"sync", "rate", "report", "check", "bag",
-                          "bags", "setup"})
+        subparsers_action = next(
+            action for action in cli.build_parser()._actions
+            if isinstance(action, argparse._SubParsersAction))
+        registered = set(subparsers_action.choices)
+        self.assertEqual(listed, registered)
 
     def test_logo_uses_braille_blanks_not_spaces_inside_the_plot(self):
         # U+2020 space would collapse in some fonts and skew the curve; the
@@ -563,8 +618,10 @@ class TestVersionAndOrder(unittest.TestCase):
         self.assertIn(f"v{__version__}", cli.format_banner())
 
     def test_banner_version_comes_from_the_single_constant(self):
-        # not a literal in the art: patching the constant must change the output
-        with patch("shotcraft.cli.__version__", "9.9.9"):
+        # not a literal in the art: patching the constant must change the output.
+        # format_banner lives in shotcraft.format now, so that is the copy of
+        # __version__ that has to be patched for the assertion to mean anything.
+        with patch("shotcraft.format.__version__", "9.9.9"):
             self.assertIn("v9.9.9", cli.format_banner())
 
     def test_the_art_itself_carries_no_version_number(self):
@@ -600,3 +657,529 @@ class TestVersionAndOrder(unittest.TestCase):
         readme = (pathlib.Path(__file__).parent.parent / "README.md").read_text()
         for line in cli.LOGO.strip("\n").splitlines():
             self.assertIn(line, readme, f"README missing logo line: {line!r}")
+
+
+class TestSyncFromDirectory(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = pathlib.Path(self.tmp.name)
+        self.blobs = self.root / "blobs"
+        self.blobs.mkdir()
+        # --from arrives via argv, not env; ROOT is only the destination store
+        # path, so that is the only thing that needs patching here (same
+        # convention as TestMain.setUp / TestBanner.setUp).
+        root_patch = patch.object(cli, "ROOT", self.root / "data")
+        root_patch.start()
+        self.addCleanup(root_patch.stop)
+
+    def test_sync_from_directory_needs_no_configured_machine(self):
+        entry = {"id": "abc123", "time": 1786351889.0, "name": "Turbo",
+                 "profile": {"name": "Turbo"},
+                 "data": [{"shot": {"pressure": 6.0, "flow": 2.0, "weight": 40.0},
+                           "profile_time": 20000, "status": "infusion"}]}
+        (self.blobs / "abc123.json").write_text(json.dumps(entry))
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            code = cli.main(["sync", "--from", str(self.blobs)])
+        self.assertEqual(code, 0)
+        self.assertIn("added 1", out.getvalue())
+
+    def test_sync_from_directory_stamps_the_blobs_capture_time_not_now(self):
+        # the entry above is dated 2026-08-10, days before this test runs;
+        # stamping `now` would hide a capture directory that stopped updating
+        entry = {"id": "abc123", "time": 1786351889.0, "name": "Turbo",
+                 "profile": {"name": "Turbo"},
+                 "data": [{"shot": {"pressure": 6.0, "flow": 2.0, "weight": 40.0},
+                           "profile_time": 20000, "status": "infusion"}]}
+        (self.blobs / "abc123.json").write_text(json.dumps(entry))
+        with contextlib.redirect_stdout(io.StringIO()):
+            cli.main(["sync", "--from", str(self.blobs)])
+        store = Store(self.root / "data")
+        self.assertGreater(store.sync_age_days(), 1.0)
+
+
+class TestFormatReveal(unittest.TestCase):
+    """The reveal is pure — rows and results in, string out — so every branch
+    is reachable without a filesystem. The wiring test only ever sees the
+    agreeing one."""
+
+    TASTE = {"lean": "sour", "intensity": 2, "versus": None}
+    ROW = {"id": "z", "yield_g": 48.0, "time_s": 32.0, "ratio": 2.66,
+           "taste": TASTE}
+    ENTRY = {"id": "z", "profile": {"name": "T", "final_weight": 40.0},
+             "data": [{"shot": {"weight": 48.0}}]}
+
+    def test_missing_numbers_render_as_dashes_not_none(self):
+        # a flagged row reaches here with null machine fields; "None" on
+        # screen reads as data rather than as absence
+        row = {"id": "x", "yield_g": None, "time_s": None, "ratio": None,
+               "taste": self.TASTE}
+        out = format_reveal(row, grade({"id": "x"}, self.TASTE), (0, 0))
+        self.assertNotIn("None", out)
+        self.assertIn("-g in -s", out)
+
+    def test_an_on_target_shot_says_the_machine_has_nothing_to_say(self):
+        # declining silently is indistinguishable from having no opinion, so
+        # the reason is always named
+        entry = {**self.ENTRY, "data": [{"shot": {"weight": 39.5}}]}
+        out = format_reveal({**self.ROW, "yield_g": 39.5},
+                            grade(entry, self.TASTE), (3, 7))
+        self.assertIn("No call to grade:", out)
+        self.assertIn("tracked its profile", out)
+
+    def test_disagreement_names_both_directions(self):
+        out = format_reveal(self.ROW, grade(self.ENTRY, self.TASTE), (1, 4))
+        self.assertIn("You called it sour", out)
+        self.assertIn("the machine points bitter", out)
+        self.assertIn("8g past the target", out)
+
+    def test_nothing_checkable_is_stated_not_left_silent(self):
+        # "0 of 0" would read as a damning ratio the tool cannot back up, and
+        # staying silent is indistinguishable from having nothing to say
+        # (extract.py's own rule) -- so it says so plainly instead, without
+        # a digit, "of", or "agreed" that would read as a score of zero.
+        out = format_reveal(self.ROW, grade(self.ENTRY, self.TASTE), (0, 0))
+        self.assertNotIn("Calls matching", out)
+        last_line = out.rsplit("\n", 1)[-1]
+        self.assertIn("could be checked against the machine", last_line)
+        self.assertNotIn(" of ", last_line)
+        self.assertNotIn("agreed", last_line)
+        self.assertFalse(any(c.isdigit() for c in last_line))
+
+    def test_a_balanced_call_reads_as_english_not_as_the_raw_enum(self):
+        # `grade` filters "both" but not "none", so a balanced call against a
+        # shot that missed its target is ordinary and reachable. Rendering the
+        # stored enum straight out produced "You called it none".
+        taste = {"lean": "none", "intensity": 0, "versus": None}
+        out = format_reveal({**self.ROW, "taste": taste},
+                            grade(self.ENTRY, taste), (1, 4))
+        self.assertIn("You called it balanced", out)
+        self.assertNotIn("called it none", out)
+        self.assertIn("the machine points bitter", out)
+
+
+class TestFormatRevealMatchedPair(unittest.TestCase):
+    """The matched-pair bonus line only appears when both `previous` and
+    `note` are supplied, exactly as `cli.py` supplies them together."""
+
+    TASTE = {"lean": "sour", "intensity": 2, "versus": None}
+    ROW = {"id": "z", "ts": "2026-08-09T07:00:00", "bag": "b001",
+           "profile": "Turbo", "yield_g": 48.0, "time_s": 32.0,
+           "ratio": 2.66, "grind": 3.1, "taste": TASTE}
+    ENTRY = {"id": "z", "profile": {"name": "T", "final_weight": 40.0},
+             "data": [{"shot": {"weight": 48.0}}]}
+    RESULT = grade(ENTRY, TASTE)
+
+    def test_no_pair_line_when_there_is_no_match(self):
+        out = format_reveal(self.ROW, self.RESULT, (1, 4))
+        self.assertNotIn("Last Turbo on this bag", out)
+
+    def test_pair_line_names_the_previous_shot_and_the_day_gap(self):
+        previous = {"ts": "2026-08-01T07:00:00", "profile": "Turbo",
+                    "yield_g": 40.0, "time_s": 28.0, "grind": 3.1}
+        note = pair_note(self.ROW, previous)
+        out = format_reveal(self.ROW, self.RESULT, (1, 4), previous, note)
+        self.assertIn("Last Turbo on this bag (2026-08-01T07:00, 8d apart): "
+                      "40.0g in 28.0s", out)
+
+    def test_same_day_pair_omits_the_apart_suffix(self):
+        previous = {"ts": "2026-08-09T06:00:00", "profile": "Turbo",
+                    "yield_g": 40.0, "time_s": 28.0, "grind": 3.1}
+        note = pair_note(self.ROW, previous)
+        out = format_reveal(self.ROW, self.RESULT, (1, 4), previous, note)
+        self.assertIn("Last Turbo on this bag (2026-08-09T06:00): "
+                      "40.0g in 28.0s", out)
+        self.assertNotIn("apart", out)
+
+    def test_five_or_more_days_apart_reads_the_bean_as_older(self):
+        previous = {"ts": "2026-08-04T07:00:00", "profile": "Turbo",
+                    "yield_g": 40.0, "time_s": 28.0, "grind": 3.1}
+        note = pair_note(self.ROW, previous)
+        self.assertEqual(note["days"], 5)
+        out = format_reveal(self.ROW, self.RESULT, (1, 4), previous, note)
+        self.assertIn("meaningfully older", out)
+
+    def test_fewer_than_five_days_apart_says_nothing_about_staleness(self):
+        previous = {"ts": "2026-08-06T07:00:00", "profile": "Turbo",
+                    "yield_g": 40.0, "time_s": 28.0, "grind": 3.1}
+        note = pair_note(self.ROW, previous)
+        self.assertEqual(note["days"], 3)
+        out = format_reveal(self.ROW, self.RESULT, (1, 4), previous, note)
+        self.assertNotIn("meaningfully older", out)
+
+    def test_suspect_redial_asks_the_question_and_names_the_fix(self):
+        previous = {"ts": "2026-08-08T07:00:00", "profile": "Turbo",
+                    "yield_g": 25.0, "time_s": 28.0, "grind": 3.1}
+        note = pair_note(self.ROW, previous)
+        self.assertTrue(note["suspect_redial"])
+        out = format_reveal(self.ROW, self.RESULT, (1, 4), previous, note)
+        self.assertIn("Did you re-dial without recording it?", out)
+        self.assertIn("dial <value>", out)
+
+    def test_a_logged_grind_change_never_triggers_the_redial_question(self):
+        previous = {"ts": "2026-08-08T07:00:00", "profile": "Turbo",
+                    "yield_g": 25.0, "time_s": 28.0, "grind": 3.4}
+        note = pair_note(self.ROW, previous)
+        self.assertFalse(note["suspect_redial"])
+        out = format_reveal(self.ROW, self.RESULT, (1, 4), previous, note)
+        self.assertNotIn("re-dial", out)
+
+
+class TestRateRevealOrdering(unittest.TestCase):
+    """The rating is the deliverable; the reveal is a bonus that may fail.
+
+    ROOT is patched with `patch.object` rather than driven through
+    SHOTCRAFT_HOME plus `importlib.reload(cli)`: reload permanently rebinds
+    the module-level ROOT, and un-patching the env var afterwards does not
+    undo it, leaving every later test in the process pointed at a deleted
+    temp directory. Same convention as TestMain.setUp and TestBanner.setUp.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = pathlib.Path(self.tmp.name)
+        root_patch = patch.object(cli, "ROOT", self.root)
+        root_patch.start()
+        self.addCleanup(root_patch.stop)
+        store = Store(self.root)
+        store.append_grinder({"id": "g001", "make": "1Zpresso", "model": "K-Ultra",
+                              "scale": "dial", "finer_direction": "lower",
+                              "note": ""})
+        store.append_bag({"id": "b001", "roaster": "r", "name": "n",
+                          "process": "washed", "roast_date": "2026-08-01",
+                          "opened": "2026-08-01", "note": ""})
+        store.append_dial({"ts": "2026-08-01T06:00:00", "grinder": "g001",
+                           "bag": "b001", "grind": 3.1, "dose_g": 18.0,
+                           "note": ""})
+        store.append_shots([{
+            "id": "shot1", "ts": "2026-08-02T07:00:00", "bag": None,
+            "profile": "Turbo", "dose_g": None, "grind": None,
+            "yield_g": 35.7, "time_s": 28.1, "ratio": None,
+            "peak_pressure": 6.1, "peak_flow": 4.2,
+            "taste": None, "taste_schema": None, "note": "", "flags": []}])
+
+    def rate(self, answers=("", "s", "2", "")):
+        out, err = io.StringIO(), io.StringIO()
+        with patch("builtins.input", scripted(list(answers))):
+            with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+                code = cli.main(["rate", "shot1"])
+        return code, out.getvalue(), err.getvalue()
+
+    def stored(self):
+        return [r for r in Store(self.root).load_shots() if r["id"] == "shot1"][0]
+
+    def telemetry(self):
+        Store(self.root).write_telemetry("shot1", {
+            "id": "shot1", "time": 1786351889.0,
+            "profile": {"name": "Turbo", "final_weight": 40.0},
+            "data": [{"shot": {"pressure": 6.0, "flow": 2.0, "weight": 35.7},
+                      "profile_time": 28100, "status": "infusion"}]})
+
+    def test_rating_lands_and_exits_zero_without_a_telemetry_blob(self):
+        code, printed, _ = self.rate()
+        self.assertEqual(code, 0)
+        self.assertIn("Recorded.", printed)
+        self.assertNotIn("Asked for", printed)
+        stored = self.stored()
+        self.assertEqual(stored["taste"]["lean"], "sour")
+        self.assertEqual(stored["taste_schema"], 3)
+
+    def test_reveal_appears_once_telemetry_exists(self):
+        self.telemetry()
+        code, printed, _ = self.rate()
+        self.assertEqual(code, 0)
+        self.assertIn("Asked for 40g", printed)
+        self.assertIn("point the same way", printed)
+
+    def test_no_machine_number_precedes_the_recorded_line(self):
+        # the ordering itself, asserted on the transcript: everything the
+        # machine knows must appear AFTER the rating is on disk, and
+        # "Recorded." is the only marker of that moment the user can see.
+        self.telemetry()
+        _, printed, _ = self.rate()
+        before = printed[:printed.index("Recorded.")]
+        # "40g", not a bare "40": a bare "40" also matches a timestamp such as
+        # 2026-08-02T07:40, which would make the fixture's ts quietly
+        # load-bearing for a reason nothing in the test records
+        for forbidden in ("35.7", "28.1", "6.1", "4.2", "1.98", "40g"):
+            self.assertNotIn(forbidden, before)
+
+    def test_a_broken_grader_costs_the_reveal_and_never_the_rating(self):
+        Store(self.root).write_telemetry("shot1", {"id": "shot1"})
+        with patch.object(cli, "grade", side_effect=RuntimeError("boom")):
+            code, printed, err = self.rate()
+        self.assertEqual(code, 0)
+        self.assertIn("Recorded.", printed)
+        self.assertIn("no reveal", err)
+        self.assertNotIn("Traceback", err)
+        stored = self.stored()
+        self.assertEqual(stored["taste"]["lean"], "sour")
+        self.assertEqual(stored["taste_schema"], 3)
+
+    def test_unreadable_telemetry_says_so_instead_of_declining_silently(self):
+        # extract.py's own words: a tool that silently declines to speak is
+        # indistinguishable from one that has nothing to say. A grader failure
+        # already explains itself; an unparseable blob must too, or the reveal
+        # just vanishes with no way to tell why.
+        (self.root / "telemetry").mkdir(parents=True, exist_ok=True)
+        (self.root / "telemetry" / "shot1.json").write_text("{not json")
+        code, printed, err = self.rate()
+        self.assertEqual(code, 0)
+        self.assertIn("Recorded.", printed)
+        self.assertIn("no reveal", err)
+        self.assertNotIn("Traceback", err)
+        self.assertEqual(self.stored()["taste"]["lean"], "sour")
+
+    def test_missing_telemetry_says_so_instead_of_declining_silently(self):
+        # no telemetry() call: the blob was never written at all, distinct
+        # from the unreadable-blob case above -- this used to return 0 with
+        # no word to the user while every other decline branch here speaks
+        code, printed, err = self.rate()
+        self.assertEqual(code, 0)
+        self.assertIn("Recorded.", printed)
+        self.assertIn("telemetry missing, no reveal", err)
+
+    def test_a_flagged_shot_is_never_graded_even_though_its_telemetry_would_agree(self):
+        # this row's own sync already flagged it as unparseable, but the raw
+        # telemetry blob below would otherwise grade cleanly AND agree with
+        # the "sour" call -- so a passing reveal here would prove the flag,
+        # not the telemetry content, is what has to decide gradeability
+        Store(self.root).update_shot("shot1",
+                                     {"flags": ["telemetry_unparsed: boom"]})
+        self.telemetry()
+        code, printed, _ = self.rate()
+        self.assertEqual(code, 0)
+        self.assertIn("Recorded.", printed)
+        self.assertIn("No call to grade:", printed)
+        self.assertIn("flagged", printed)
+
+
+class TestReportSchemaThree(unittest.TestCase):
+    def _row(self, shot_id, lean, intensity, bag="b001", grinder="g001"):
+        return {"id": shot_id, "ts": "2026-08-10T07:00:00", "bag": bag,
+                "grinder": grinder, "profile": "Turbo", "dose_g": 18.0,
+                "grind": 3.1, "yield_g": 40.0, "time_s": 28.0, "ratio": 2.22,
+                "taste": {"lean": lean, "intensity": intensity, "versus": None},
+                "taste_schema": 3, "note": "", "flags": []}
+
+    def test_schema_three_rating_renders(self):
+        out = fmt.format_report([self._row("a", "sour", 2)],
+                                [{"id": "b001", "roast_date": "2026-08-01"}])
+        self.assertIn("sour/2", out)
+
+    def test_mixed_schemas_warn(self):
+        v2 = self._row("b", "sour", 2)
+        v2["taste"] = {"sour": 3, "bitter": 1, "body": 5, "overall": 7}
+        v2["taste_schema"] = 2
+        out = fmt.format_report([self._row("a", "sour", 2), v2],
+                                [{"id": "b001", "roast_date": "2026-08-01"}])
+        self.assertIn("not comparable", out)
+
+    def test_multiple_grinders_on_one_bag_warn(self):
+        rows = [self._row("a", "sour", 2, grinder="g001"),
+                self._row("b", "sour", 2, grinder="g002")]
+        out = fmt.format_report(rows, [{"id": "b001", "roast_date": "2026-08-01"}])
+        self.assertIn("grinder", out.lower())
+
+    def test_a_grind_logged_with_no_grinder_id_is_its_own_bucket(self):
+        # a legacy row (rated before the grinder concept existed) carries a
+        # grind value but no `grinder` key at all -- dropping it from the
+        # pooling check let it silently pool with g001's numbers and warn
+        # about nothing, when "unknown" is no more comparable to g001 than
+        # g002 is
+        legacy = self._row("a", "sour", 2, grinder="g001")
+        del legacy["grinder"]
+        rows = [legacy, self._row("b", "sour", 2, grinder="g001")]
+        out = fmt.format_report(rows, [{"id": "b001", "roast_date": "2026-08-01"}])
+        self.assertIn("grinder", out.lower())
+        self.assertIn("not comparable", out)
+
+    def test_uniformly_ungrindered_rows_do_not_falsely_warn(self):
+        # everything missing a grinder id together is not "mixed" -- just
+        # legacy-only, no warning earned
+        legacy = self._row("a", "sour", 2, grinder="g001")
+        del legacy["grinder"]
+        out = fmt.format_report([legacy], [{"id": "b001", "roast_date": "2026-08-01"}])
+        self.assertNotIn("not comparable", out)
+
+    def test_advice_names_the_concrete_dial_direction_when_the_grinder_is_known(self):
+        rows = [self._row(str(i), "sour", 2) for i in range(5)]
+        grinders = [{"id": "g001", "finer_direction": "lower"}]
+        out = fmt.format_report(rows, [{"id": "b001", "roast_date": "2026-08-01"}],
+                                grinders=grinders, tally_for=lambda _rows: (4, 5))
+        self.assertIn("a finer grind (a lower number on g001)", out)
+
+    def test_advice_names_the_opposite_direction_for_bitter(self):
+        rows = [self._row(str(i), "bitter", 2) for i in range(5)]
+        grinders = [{"id": "g001", "finer_direction": "higher"}]
+        out = fmt.format_report(rows, [{"id": "b001", "roast_date": "2026-08-01"}],
+                                grinders=grinders, tally_for=lambda _rows: (4, 5))
+        self.assertIn("a coarser grind (a lower number on g001)", out)
+
+    def test_advice_falls_back_to_generic_wording_with_no_grinder_registered(self):
+        # honest about the limit rather than guessing a dial direction --
+        # model.grinder_row's own docstring is why this cannot be invented
+        rows = [self._row(str(i), "sour", 2) for i in range(5)]
+        out = fmt.format_report(rows, [{"id": "b001", "roast_date": "2026-08-01"}],
+                                tally_for=lambda _rows: (4, 5))
+        self.assertIn("finer grind or longer contact", out)
+        self.assertNotIn("number on", out)
+
+    def test_advice_appears_at_five_ratings(self):
+        rows = [self._row(str(i), "sour", 2) for i in range(5)]
+        out = fmt.format_report(rows, [{"id": "b001", "roast_date": "2026-08-01",
+                                        "roaster": "r"}],
+                                tally_for=lambda _rows: (4, 5))
+        self.assertIn("leans sour in 5 of 5", out)
+        self.assertIn("4 of 5", out)
+
+    def test_no_advice_below_five_ratings(self):
+        rows = [self._row(str(i), "sour", 2) for i in range(4)]
+        out = fmt.format_report(rows, [{"id": "b001", "roast_date": "2026-08-01"}],
+                                tally_for=lambda _rows: (3, 4))
+        self.assertNotIn("leans sour", out)
+
+    def test_verdict_renders_balanced_and_both_leans(self):
+        # "none" and "both" are real calls, not the absence of one. "none"
+        # renders as "balanced" -- the same word `_called` uses in the
+        # reveal, so the two screens share one vocabulary instead of drifting
+        # (storage stays the literal "none")
+        balanced = self._row("z", "none", 0)
+        both = self._row("y", "both", 3)
+        out = fmt.format_report([balanced, both],
+                                [{"id": "b001", "roast_date": "2026-08-01"}])
+        self.assertIn("balanced/0", out)
+        self.assertIn("both/3", out)
+
+    def test_verdict_renders_versus_suffix(self):
+        row = self._row("v", "bitter", 1)
+        row["taste"]["versus"] = {"shot": "some-other-id", "verdict": "better"}
+        out = fmt.format_report([row], [{"id": "b001", "roast_date": "2026-08-01"}])
+        self.assertIn("bitter/1 vs better", out)
+
+    def test_unmixed_schema_bag_keeps_single_confidence_label(self):
+        # a bag rated entirely under schema 3 must render exactly as it did
+        # before this round: one tier, no pooling qualifier
+        rows = [self._row(str(i), "sour", 2) for i in range(5)]
+        out = fmt.format_report(rows, [{"id": "b001", "roast_date": "2026-08-01"}])
+        self.assertIn("[pattern]", out)
+        self.assertNotIn("pooled", out)
+
+    def test_mixed_schema_bag_splits_confidence_label(self):
+        # 8 schema-3 ratings (their own tier: pattern) plus 2 older-schema
+        # ratings (pooled tier: hypothesis, n=10) on the same bag. The pooled
+        # tier must not stand alone above the schema-3-specific leans/
+        # agreement lines that follow -- a reader could otherwise carry
+        # "hypothesis" onto a claim only "pattern" actually supports.
+        v3_rows = ([self._row(str(i), "sour", 2) for i in range(6)]
+                  + [self._row(f"b{i}", "bitter", 2) for i in range(2)])
+        old_v2 = self._row("old1", "sour", 2)
+        old_v2["taste"] = {"sour": 3, "bitter": 1, "body": 5, "overall": 7}
+        old_v2["taste_schema"] = 2
+        old_v1 = self._row("old2", "sour", 2)
+        old_v1["taste"] = {"sour_bitter": 0, "body": 4, "overall": 4}
+        old_v1["taste_schema"] = 1
+        rows = v3_rows + [old_v2, old_v1]
+        out = fmt.format_report(rows, [{"id": "b001", "roast_date": "2026-08-01"}])
+        self.assertIn("pattern for the 8 schema-3 ratings", out)
+        self.assertIn("hypothesis pooled across all 10", out)
+
+    def test_agreement_line_states_unchecked_when_not_gradeable(self):
+        # majority + not gradeable: silence here would read as a lean that
+        # passed a check it never underwent, so the qualifier must speak
+        # plainly rather than vanish. It must also not be readable as
+        # "0 of N agreed" -- that would be a damning verdict; the truth is
+        # merely that nothing could be checked at all.
+        rows = [self._row(str(i), "sour", 2) for i in range(5)]
+        out = fmt.format_report(rows, [{"id": "b001", "roast_date": "2026-08-01"}],
+                                tally_for=lambda _rows: (0, 0))
+        self.assertIn("leans sour in 5 of 5", out)
+        self.assertIn("unchecked", out)
+        self.assertIn("not disagreement", out)
+        self.assertNotIn("agreed with the machine in 0 of", out)
+
+    def test_no_majority_still_reports_ratio_when_gradeable(self):
+        # no majority + gradeable: the ratio line was never gated on a lean
+        # existing, and stays that way -- it's informational about the
+        # calls' track record regardless of whether this batch leaned
+        rows = [self._row("a", "sour", 2), self._row("b", "sour", 2),
+                self._row("c", "bitter", 2), self._row("d", "bitter", 2),
+                self._row("e", "none", 0)]
+        out = fmt.format_report(rows, [{"id": "b001", "roast_date": "2026-08-01"}],
+                                tally_for=lambda _rows: (3, 5))
+        self.assertNotIn("leans", out)
+        self.assertIn("your calls agreed with the machine in 3 of 5", out)
+
+    def test_no_majority_still_reports_unchecked_when_not_gradeable(self):
+        # the combination that used to render completely silent: no leans
+        # line (no majority) and nothing gradeable. The advice block only
+        # renders once there are enough ratings to tempt a conclusion, so
+        # checkability is worth stating either way -- neither variant is
+        # gated on the leans line. Must not read as commentary on a lean
+        # that was never claimed, so no "leans"/direction word appears.
+        rows = [self._row("a", "sour", 2), self._row("b", "sour", 2),
+                self._row("c", "bitter", 2), self._row("d", "bitter", 2),
+                self._row("e", "none", 0)]
+        out = fmt.format_report(rows, [{"id": "b001", "roast_date": "2026-08-01"}],
+                                tally_for=lambda _rows: (0, 0))
+        self.assertNotIn("leans", out)
+        self.assertIn("unchecked", out)
+        self.assertIn("not disagreement", out)
+        self.assertNotIn("agreed with the machine in 0 of", out)
+
+
+class TestNudgeIsSafeInAPrompt(unittest.TestCase):
+    """nudge runs inside a shell prompt hook: never raise, never touch the
+    network, never print past a stale stamp.
+
+    ROOT is patched with `patch.object` rather than SHOTCRAFT_HOME plus
+    `importlib.reload(cli)`: same reasoning as TestRateRevealOrdering above --
+    reload permanently rebinds the module-level ROOT, and un-patching the env
+    var afterwards does not undo it, leaving every later test in the process
+    pointed at a deleted temp directory.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = pathlib.Path(self.tmp.name)
+        root_patch = patch.object(cli, "ROOT", self.root)
+        root_patch.start()
+        self.addCleanup(root_patch.stop)
+
+    def test_exits_zero_and_prints_nothing_on_a_freshly_synced_record(self):
+        # NOT a truly empty install: ad03e0e (the commit right before this
+        # task started) made never-synced print "last sync never" on
+        # purpose -- "the default state of every fresh install, not an edge
+        # case" -- so an install with no stamp at all is not the silent
+        # case. Genuine silence needs zero unrated shots AND a recent sync.
+        Store(self.root).write_sync_stamp()
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            code = cli.main(["nudge", "--force"])
+        self.assertEqual(code, 0)
+        self.assertEqual(out.getvalue(), "")
+        self.assertEqual(err.getvalue(), "")
+
+    def test_opens_no_socket(self):
+        # AssertionError is an Exception subclass, and nudge's own blanket
+        # `except Exception: pass` swallows it before `return 0` -- so a
+        # side_effect version of this test passed whether or not a socket
+        # was ever opened. A Mock plus a call-count assertion made OUTSIDE
+        # nudge's own try/except is what actually pins this.
+        import socket
+        with contextlib.redirect_stdout(io.StringIO()):
+            with patch.object(socket, "socket") as mock_socket:
+                self.assertEqual(cli.main(["nudge", "--force"]), 0)
+        mock_socket.assert_not_called()
+
+    def test_exits_zero_even_when_the_store_is_corrupt(self):
+        pathlib.Path(self.root, "shots.jsonl").write_text("{not json\n")
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(cli.main(["nudge", "--force"]), 0)
+
+
+if __name__ == "__main__":
+    unittest.main()
