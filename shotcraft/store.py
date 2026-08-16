@@ -1,7 +1,13 @@
 """JSONL persistence for shots and bags, plus per-shot telemetry blobs.
 
-Telemetry blobs are committed to git on purpose: if the machine's history
-endpoint turns out to be a rolling window, these files are the only copy.
+Everything here lives in the XDG data dir, never in the repo, and is
+gitignored: it is a personal record, not source.
+
+The machine's history endpoint is a rolling window of 20 entries. That is
+measured, not assumed. So once a shot rolls off, the local blob is the only
+copy that exists anywhere, which is why every write in this module goes
+through a temp file and an atomic rename: a torn write here loses shots that
+cannot be fetched again.
 """
 import datetime
 import json
