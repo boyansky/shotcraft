@@ -310,6 +310,58 @@ class TestMain(unittest.TestCase):
         self.assertIn("your calls agreed with the machine in 5 of 5", out)
 
 
+class TestDialCommand(unittest.TestCase):
+    """Amendment 3: `dial` records a bean default or a profile-specific
+    setting, and the confirmation line must say plainly which one it just
+    recorded."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = pathlib.Path(self.tmp.name)
+        root_patch = patch.object(cli, "ROOT", self.root)
+        root_patch.start()
+        self.addCleanup(root_patch.stop)
+        env = patch.dict(os.environ, {"SHOTCRAFT_API_URL": "http://192.0.2.1",
+                                      "XDG_CONFIG_HOME": str(self.root / "cfg")})
+        env.start(); self.addCleanup(env.stop)
+        store = Store(self.root)
+        store.append_grinder({"id": "g001", "make": "1Zpresso", "model": "K-Ultra",
+                              "scale": "decimal dial 0.0-9.0",
+                              "finer_direction": "lower", "note": ""})
+        store.append_bag({"id": "b001", "roaster": "r", "name": "n",
+                          "process": "washed", "roast_date": "2026-08-01",
+                          "opened": "2026-08-01", "note": ""})
+
+    def run_main(self, argv):
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            code = cli.main(argv)
+        return code, out.getvalue(), err.getvalue()
+
+    def test_bare_dial_records_a_bean_default_and_says_so(self):
+        code, out, err = self.run_main(["dial", "3.1", "--dose", "18", "--bag", "b001"])
+        self.assertEqual(code, 0, err)
+        self.assertIn("default", out.lower())
+        dials = Store(self.root).load_dials()
+        self.assertIsNone(dials[-1]["profile"])
+
+    def test_profile_flag_records_a_profile_specific_dial_and_names_it(self):
+        code, out, err = self.run_main(
+            ["dial", "3.1", "--dose", "18", "--bag", "b001", "--profile", "Turbo"])
+        self.assertEqual(code, 0, err)
+        self.assertIn("Turbo", out)
+        dials = Store(self.root).load_dials()
+        self.assertEqual(dials[-1]["profile"], "Turbo")
+
+    def test_the_two_confirmation_lines_are_distinguishable(self):
+        _, default_out, _ = self.run_main(
+            ["dial", "3.1", "--dose", "18", "--bag", "b001"])
+        _, profile_out, _ = self.run_main(
+            ["dial", "3.2", "--dose", "18", "--bag", "b001", "--profile", "Turbo"])
+        self.assertNotEqual(default_out, profile_out)
+
+
 class TestFormatBags(unittest.TestCase):
     BAGS = [
         {"id": "b001", "roaster": "Copenhagen Roasters", "name": "Slow Roast",
@@ -508,6 +560,12 @@ class TestBanner(unittest.TestCase):
     def test_description_lines_stay_narrow(self):
         for line in cli.DESCRIPTION:
             self.assertLessEqual(len(line), 68, line)
+
+    def test_dial_command_mentions_profile_flag(self):
+        # --profile is a real, undiscoverable-without-help flag; a reader of
+        # the bare banner should learn it exists without reaching for --help
+        name, description = next(nd for nd in cli.COMMANDS if nd[0] == "dial <value>")
+        self.assertIn("--profile", description)
 
     def test_logo_contains_the_glass(self):
         # the mark is a glass with the curve as its steam; losing either half

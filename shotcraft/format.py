@@ -111,7 +111,7 @@ COMMANDS = [
     ("bags", "list bags, marking the current one"),
     ("grinder", "register a grinder"),
     ("grinders", "list registered grinders"),
-    ("dial <value>", "record a re-dial: grind, and dose if it changed"),
+    ("dial <value>", "record a re-dial: grind and dose; --profile scopes it"),
     ("nudge", "one line for a shell prompt hook, else silent"),
 ]
 

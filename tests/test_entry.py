@@ -68,6 +68,16 @@ class TestRateShot(Base):
         self.assertEqual(row["dose_g"], 18.0)
         self.assertEqual(row["ratio"], 1.98)
 
+    def test_rate_shot_resolves_a_profile_specific_dial_over_the_bean_default(self):
+        # shot1's profile is "Turbo" (see setUp). A Turbo-specific dial logged
+        # after the bean default must win when rating it -- this pins that
+        # rate_shot actually threads the shot's own stored profile string
+        # into resolve_dial rather than resolving bean-default only.
+        record_dial(self.store, 2.6, dose_g=18.0, bag="b001", profile="Turbo",
+                    now=datetime.datetime(2026, 8, 1, 6, 30))
+        row = rate_shot(self.store, "shot1", scripted(["", "s", "2", ""]))
+        self.assertEqual(row["grind"], 2.6)
+
     def test_intensity_is_not_asked_when_lean_is_none(self):
         row = rate_shot(self.store, "shot1", scripted(["", "-", ""]))
         self.assertEqual(row["taste"]["intensity"], 0)
@@ -445,6 +455,129 @@ class TestDial(Base):
         empty = Store(self.root / "empty")
         with self.assertRaises(ValueError):
             record_dial(empty, 3.1, dose_g=18.0, bag="b001")
+
+    # -- Amendment 3: grind varies by profile, not by bean alone --------
+
+    def test_records_profile_specific_dial(self):
+        dial = record_dial(self.store, 3.1, dose_g=18.0, bag="b001", profile="Turbo")
+        self.assertEqual(dial["profile"], "Turbo")
+
+    def test_records_bean_default_dial_with_null_profile(self):
+        dial = record_dial(self.store, 3.1, dose_g=18.0, bag="b001")
+        self.assertIsNone(dial["profile"])
+
+    def test_profile_specific_event_resolves_over_bean_default(self):
+        self.store.append_dial({"ts": "2026-08-01T08:00:00", "grinder": "g001",
+                                "bag": "b001", "profile": None,
+                                "grind": 2.9, "dose_g": 18.0})
+        self.store.append_dial({"ts": "2026-08-01T09:00:00", "grinder": "g001",
+                                "bag": "b001", "profile": "Turbo",
+                                "grind": 3.1, "dose_g": 18.0})
+        got = resolve_dial(self.store, "g001", "b001", "2026-08-02T07:00:00", "Turbo")
+        self.assertEqual(got["grind"], 3.1)
+
+    def test_specificity_beats_recency_even_when_the_bean_default_is_newer(self):
+        # A profile-specific event and a bean-default event both exist, and the
+        # bean default is the NEWER of the two. Level 1 must still win: this is
+        # the case most likely to be got backwards.
+        self.store.append_dial({"ts": "2026-08-01T08:00:00", "grinder": "g001",
+                                "bag": "b001", "profile": "Turbo",
+                                "grind": 3.1, "dose_g": 18.0})
+        self.store.append_dial({"ts": "2026-08-05T08:00:00", "grinder": "g001",
+                                "bag": "b001", "profile": None,
+                                "grind": 2.5, "dose_g": 18.0})
+        got = resolve_dial(self.store, "g001", "b001", "2026-08-06T07:00:00", "Turbo")
+        self.assertEqual(got["grind"], 3.1)
+
+    def test_falls_back_to_bean_default_when_no_profile_specific_event_exists(self):
+        self.store.append_dial({"ts": "2026-08-01T08:00:00", "grinder": "g001",
+                                "bag": "b001", "profile": None,
+                                "grind": 2.9, "dose_g": 18.0})
+        got = resolve_dial(self.store, "g001", "b001", "2026-08-02T07:00:00", "Turbo")
+        self.assertEqual(got["grind"], 2.9)
+
+    def test_two_profile_specific_events_each_resolve_their_own_profile(self):
+        self.store.append_dial({"ts": "2026-08-01T08:00:00", "grinder": "g001",
+                                "bag": "b001", "profile": "Turbo",
+                                "grind": 3.1, "dose_g": 18.0})
+        self.store.append_dial({"ts": "2026-08-01T08:30:00", "grinder": "g001",
+                                "bag": "b001", "profile": "Traditional Lever",
+                                "grind": 1.5, "dose_g": 18.0})
+        turbo = resolve_dial(self.store, "g001", "b001", "2026-08-02T07:00:00", "Turbo")
+        lever = resolve_dial(self.store, "g001", "b001", "2026-08-02T07:00:00",
+                             "Traditional Lever")
+        self.assertEqual(turbo["grind"], 3.1)
+        self.assertEqual(lever["grind"], 1.5)
+
+    def test_never_resolves_a_profile_specific_event_from_a_later_shot(self):
+        # the at-or-before rule holds at level 1 too, not just level 2
+        self.store.append_dial({"ts": "2026-08-05T08:00:00", "grinder": "g001",
+                                "bag": "b001", "profile": "Turbo",
+                                "grind": 3.1, "dose_g": 18.0})
+        self.assertIsNone(
+            resolve_dial(self.store, "g001", "b001", "2026-08-02T07:00:00", "Turbo"))
+
+    def test_empty_shot_profile_lands_on_bean_default_not_a_coincidental_match(self):
+        # a flagged row can carry profile "" -- treat that as "no profile" and
+        # go straight to the bean default, never matched against an event
+        # whose own profile happens to be falsy by accident
+        self.store.append_dial({"ts": "2026-08-01T08:00:00", "grinder": "g001",
+                                "bag": "b001", "profile": None,
+                                "grind": 2.9, "dose_g": 18.0})
+        got = resolve_dial(self.store, "g001", "b001", "2026-08-02T07:00:00", "")
+        self.assertEqual(got["grind"], 2.9)
+
+    def test_backward_compatible_rows_without_a_profile_key_are_bean_defaults(self):
+        # dial rows written before Amendment 3 have no "profile" key at all;
+        # .get("profile") is None, so they must land on level 2 exactly like
+        # an explicit null, with no migration required
+        self.store.append_dial({"ts": "2026-08-01T08:00:00", "grinder": "g001",
+                                "bag": "b001", "grind": 2.9, "dose_g": 18.0})
+        got = resolve_dial(self.store, "g001", "b001", "2026-08-02T07:00:00", "Turbo")
+        self.assertEqual(got["grind"], 2.9)
+
+    def test_profile_is_stripped_so_a_trailing_space_still_matches(self):
+        # the shot-side profile is always stripped at storage time
+        # (model.shot_row / model.flagged_row); a padded --profile that was
+        # NOT stripped would create a dial event that can never match any
+        # shot, silently falling back to the bean default forever
+        dial = record_dial(self.store, 3.1, dose_g=18.0, bag="b001",
+                           profile="Turbo ",
+                           now=datetime.datetime(2026, 8, 1, 6, 0))
+        self.assertEqual(dial["profile"], "Turbo")
+        got = resolve_dial(self.store, "g001", "b001", "2026-08-02T07:00:00", "Turbo")
+        self.assertEqual(got["grind"], 3.1)
+
+    def test_whitespace_only_profile_is_stored_as_the_bean_default(self):
+        dial = record_dial(self.store, 3.1, dose_g=18.0, bag="b001", profile="   ")
+        self.assertIsNone(dial["profile"])
+
+    def test_dose_carries_forward_from_the_same_profile_dial_first(self):
+        # A profile-specific dial and a NEWER bean-default dial both exist;
+        # the same-profile dose must win, mirroring grind's specificity-over-
+        # recency rather than falling back to "most recent for this bag."
+        # Explicit, well-separated `now=` values: same-second ties would let
+        # insertion order (Turbo recorded first) pass this by accident.
+        record_dial(self.store, 3.1, dose_g=18.0, bag="b001", profile="Turbo",
+                    now=datetime.datetime(2026, 8, 1, 6, 0))
+        record_dial(self.store, 2.5, dose_g=20.0, bag="b001",
+                    now=datetime.datetime(2026, 8, 5, 6, 0))   # bean default, newer
+        later = record_dial(self.store, 3.3, bag="b001", profile="Turbo",
+                            now=datetime.datetime(2026, 8, 6, 6, 0))
+        self.assertEqual(later["dose_g"], 18.0)
+
+    def test_dose_falls_back_to_the_bean_default_when_no_profile_specific_dose_exists(self):
+        record_dial(self.store, 2.5, dose_g=20.0, bag="b001")   # bean default
+        later = record_dial(self.store, 3.3, bag="b001", profile="Turbo")
+        self.assertEqual(later["dose_g"], 20.0)
+
+    def test_dose_still_falls_back_to_the_last_dial_anywhere_as_a_last_resort(self):
+        # neither this bag's profile-specific dose nor its bean default
+        # exists yet; falls back to the last dial anywhere, unchanged
+        new_bag(self.store, scripted(["roaster2", "name2", "washed", "2026-08-05", ""]))
+        record_dial(self.store, 3.1, dose_g=18.0, bag="b001", profile="Turbo")
+        later = record_dial(self.store, 2.8, bag="b002", profile="Turbo")
+        self.assertEqual(later["dose_g"], 18.0)
 
 class TestCurrentBagIsMostRecentlyUsed(Base):
     def test_uses_most_recent_rated_shot_not_registration_order(self):

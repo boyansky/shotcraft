@@ -120,6 +120,10 @@ def build_parser():
     dial_cmd.add_argument("--dose", type=float, dest="dose")
     dial_cmd.add_argument("--bag")
     dial_cmd.add_argument("--grinder")
+    dial_cmd.add_argument("--profile",
+                          help="record this dial for one profile only, not the "
+                               "bean default (the machine's own profile name, "
+                               "verbatim)")
     setup_cmd = sub.add_parser("setup", help="find your machine and remember it")
     setup_cmd.add_argument("--show", action="store_true",
                            help="print the current configuration and exit")
@@ -342,14 +346,19 @@ def main(argv=None):
     if args.command == "dial":
         try:
             dial = record_dial(store, args.grind, dose_g=args.dose,
-                               bag=args.bag, grinder=args.grinder)
+                               bag=args.bag, grinder=args.grinder,
+                               profile=args.profile)
         except ValueError as exc:
             print(f"Not recorded: {exc}", file=sys.stderr)
             return 1
         bag = store.bag_by_id(dial["bag"]) or {}
         label = " / ".join(x for x in (bag.get("roaster"), bag.get("name")) if x)
+        # say plainly which of the two this just recorded: a profile-specific
+        # dial only ever applies to that one profile, a bean default applies
+        # to every profile that has no dial of its own
+        scope = f"for profile {dial['profile']!r}" if dial["profile"] else "as bean default"
         print(f"{dial['bag']} {label}  grind {dial['grind']:g}  "
-              f"dose {dial['dose_g']:g}g  on {dial['grinder']}")
+              f"dose {dial['dose_g']:g}g  on {dial['grinder']}  {scope}")
         return 0
 
     if args.command == "nudge":

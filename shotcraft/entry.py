@@ -194,7 +194,8 @@ def rate_shot(store, shot_id, ask=None):
     # grind and dose are read off the dial log rather than typed per shot:
     # they are properties of the setup, not of the cup, and asking again every
     # morning is three of the keystrokes that killed the previous version
-    dial = resolve_dial(store, grinder, bag, row.get("ts")) if grinder else None
+    dial = resolve_dial(store, grinder, bag, row.get("ts"),
+                        row.get("profile")) if grinder else None
     grind = dial["grind"] if dial else row.get("grind")
     dose = dial["dose_g"] if dial else row.get("dose_g")
 
@@ -283,12 +284,27 @@ def new_grinder(store, ask=None):
 
 
 def record_dial(store, grind, dose_g=None, bag=None, grinder=None, note="",
-                now=None):
+                now=None, profile=None):
     """Record a re-dial. Grind and dose stand until the next one.
 
-    `dose_g` carries forward from the last dial for the same (grinder, bag),
-    then from the last dial anywhere, because a basket does not change when a
-    collar does. The first dial ever must state it.
+    `dose_g` carries forward with the same specificity as grind resolution
+    (Amendment 3, extended here rather than left an unverified premise: "a
+    basket does not change when a collar does" was never checked against the
+    archive, the same shape of mistake A3 itself exists to fix): the last
+    dial for this exact (grinder, bag, profile), else the bean default (same
+    grinder+bag, profile null), else the last dial anywhere. The first dial
+    ever must state it.
+
+    `profile` is nullable (Amendment 3): grind is a standing property of
+    (grinder, bean, profile), not just (grinder, bean) -- the owner re-dials
+    per profile, deliberately, every time. `None` records a bean default, in
+    force until a profile-specific event overrides it (see `resolve_dial`).
+    Stripped, and an empty or whitespace-only string means the same as
+    `None`: the shot-side profile this must eventually match is always
+    stripped at storage time (`model.shot_row`, `model.flagged_row`), so an
+    unstripped `--profile "Turbo "` would otherwise create a dial event that
+    can never match any shot and silently falls back to the bean default
+    forever.
     """
     grinder = grinder or default_grinder_id(store)
     if grinder is None:
@@ -301,33 +317,67 @@ def record_dial(store, grind, dose_g=None, bag=None, grinder=None, note="",
     if bag is None or store.bag_by_id(bag) is None:
         raise ValueError(f"unknown bag {bag!r}; create it first with the bag command")
 
+    profile = (profile or "").strip() or None
+
     if dose_g is None:
         dials = store.load_dials()
-        same = [d for d in dials
-                if d.get("grinder") == grinder and d.get("bag") == bag]
-        source = same or dials
+        same_profile = [d for d in dials
+                        if d.get("grinder") == grinder and d.get("bag") == bag
+                        and d.get("profile") == profile]
+        bean_default = [d for d in dials
+                        if d.get("grinder") == grinder and d.get("bag") == bag
+                        and d.get("profile") is None]
+        source = same_profile or bean_default or dials
         if not source:
             raise ValueError("dose is required for the first dial-in")
         dose_g = max(source, key=lambda d: d.get("ts") or "")["dose_g"]
 
     dial = {"ts": (now or datetime.datetime.now()).isoformat(timespec="seconds"),
-            "grinder": grinder, "bag": bag,
+            "grinder": grinder, "bag": bag, "profile": profile,
             "grind": float(grind), "dose_g": float(dose_g), "note": note.strip()}
     store.append_dial(dial)
     return dial
 
 
-def resolve_dial(store, grinder_id, bag_id, ts):
-    """The dial-in in force for this (grinder, bag) at `ts`, or None.
+def resolve_dial(store, grinder_id, bag_id, ts, profile=None):
+    """The dial-in in force for this (grinder, bag[, profile]) at `ts`, or None.
 
-    Strictly at-or-before: resolving to a later event would attribute a shot to
-    a setting that did not exist when it was pulled.
+    Three levels, most specific first (Amendment 3):
+
+    1. latest event matching (grinder, bag, profile) at or before `ts` --
+       the profile-specific setting, when one has been dialled.
+    2. else latest event matching (grinder, bag) with `profile` null -- the
+       bean's default, so bootstrapping does not demand every bag crossed
+       with every profile before a single grind resolves.
+    3. else None, and the caller's grind stays null exactly as before.
+
+    Strictly at-or-before at BOTH levels: resolving to a later event would
+    attribute a shot to a setting that did not exist when it was pulled.
+    Specificity beats recency -- a newer bean default never outranks an
+    older profile-specific event.
+
+    `profile` falsy (None, "", or a flagged row's missing name) skips level 1
+    entirely rather than matching it against a dial whose own `profile` is
+    also falsy by accident; it goes straight to the bean default. Rows
+    written before Amendment 3 have no "profile" key at all, so
+    `.get("profile")` is None and they land on level 2 unchanged.
     """
     if not ts:
         return None
-    candidates = [d for d in store.load_dials()
-                  if d.get("grinder") == grinder_id and d.get("bag") == bag_id
-                  and (d.get("ts") or "") <= ts]
-    if not candidates:
+    dials = store.load_dials()
+
+    def candidates(match_profile):
+        return [d for d in dials
+                if d.get("grinder") == grinder_id and d.get("bag") == bag_id
+                and d.get("profile") == match_profile
+                and (d.get("ts") or "") <= ts]
+
+    if profile:
+        specific = candidates(profile)
+        if specific:
+            return max(specific, key=lambda d: d.get("ts") or "")
+
+    default = candidates(None)
+    if not default:
         return None
-    return max(candidates, key=lambda d: d.get("ts") or "")
+    return max(default, key=lambda d: d.get("ts") or "")
